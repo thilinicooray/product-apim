@@ -29,26 +29,28 @@ import com.google.gson.Gson;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import org.apache.axiom.om.OMElement;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.FilenameUtils;
 import org.apache.commons.io.IOUtils;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 
+import org.wso2.carbon.apimgt.api.APIDefinition;
 import org.wso2.carbon.apimgt.api.APIManagementException;
 import org.wso2.carbon.apimgt.api.APIProvider;
 import org.wso2.carbon.apimgt.api.FaultGatewaysException;
-import org.wso2.carbon.apimgt.api.model.API;
-import org.wso2.carbon.apimgt.api.model.APIIdentifier;
-import org.wso2.carbon.apimgt.api.model.Documentation;
-import org.wso2.carbon.apimgt.api.model.Icon;
-import org.wso2.carbon.apimgt.api.model.Tier;
+import org.wso2.carbon.apimgt.api.model.*;
 import org.wso2.carbon.apimgt.impl.APIConstants;
+import org.wso2.carbon.apimgt.impl.definitions.APIDefinitionFromSwagger20;
+import org.wso2.carbon.apimgt.impl.handlers.ScopesIssuer;
 import org.wso2.carbon.apimgt.impl.utils.APIUtil;
 
 import org.wso2.carbon.registry.api.Registry;
+import org.wso2.carbon.registry.core.RegistryConstants;
 import org.wso2.carbon.registry.core.Resource;
 
+import javax.xml.namespace.QName;
 import java.io.BufferedInputStream;
 import java.io.BufferedReader;
 import java.io.File;
@@ -67,7 +69,6 @@ import java.util.Enumeration;
 import java.util.Set;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
-import java.util.zip.ZipInputStream;
 
 /**
  * This class provides the functions utilized to import an API from an API archive.
@@ -144,7 +145,8 @@ public final class APIImportUtil {
 
                 //This index variable is used to get the extracted folder name; that is root directory
                 if (index == 0) {
-                    archiveName = currentEntry.substring(0, currentEntry.indexOf(File.separatorChar));
+                    archiveName =
+                        currentEntry.substring(0, currentEntry.indexOf(APIImportExportConstants.ARCHIVE_PATH_SEPARATOR));
                     --index;
                 }
 
@@ -253,14 +255,14 @@ public final class APIImportUtil {
         }
 
         try{
+            int tenantId = APIUtil.getTenantId(currentUser);
             provider.addAPI(importedApi);
-            addSwaggerDefinition(importedApi.getId(), pathToArchive);
+            addSwaggerDefinition(importedApi, pathToArchive, tenantId);
         } catch (APIManagementException e){
             //Error is logged and APIImportException is thrown because adding API and swagger are mandatory steps
             log.error("Error in adding API to the provider. ", e);
             throw new APIImportException("Error in adding API to the provider. " + e.getMessage());
         }
-
         //Since Image, documents, sequences and WSDL are optional, exceptions are logged and ignored in implementation
         addAPIImage(pathToArchive, importedApi);
         addAPIDocuments(pathToArchive, importedApi);
@@ -392,34 +394,61 @@ public final class APIImportUtil {
     private static void addAPISequences(String pathToArchive, API importedApi, String currentUser) {
 
         Registry registry = APIExportUtil.getRegistry(currentUser);
-        String inSequenceFileName = importedApi.getInSequence() + APIImportExportConstants.XML_EXTENSION;
-        String inSequenceFileLocation = pathToArchive + APIImportExportConstants.IN_SEQUENCE_LOCATION
-                + inSequenceFileName;
-
         //Adding in-sequence, if any
-        if (checkFileExistence(inSequenceFileLocation)) {
-            addSequenceToRegistry(registry, APIConstants.API_CUSTOM_SEQUENCE_TYPE_IN,
-                    inSequenceFileName, inSequenceFileLocation);
+        String inSequenceName = importedApi.getInSequence();
+        if (inSequenceName != null && !inSequenceName.isEmpty()) {
+            importAPISequence(inSequenceName, registry, APIConstants.API_CUSTOM_SEQUENCE_TYPE_IN,pathToArchive,
+                APIImportExportConstants.IN_SEQUENCE_LOCATION);
         }
-
-        String outSequenceFileName = importedApi.getOutSequence() + APIImportExportConstants.XML_EXTENSION;
-        String outSequenceFileLocation = pathToArchive + APIImportExportConstants.OUT_SEQUENCE_LOCATION
-                + outSequenceFileName;
 
         //Adding out-sequence, if any
-        if (checkFileExistence(outSequenceFileLocation)) {
-            addSequenceToRegistry(registry, APIConstants.API_CUSTOM_SEQUENCE_TYPE_OUT,
-                    outSequenceFileName, outSequenceFileLocation);
+        String outSequenceName = importedApi.getOutSequence();
+        if (outSequenceName != null && !outSequenceName.isEmpty()) {
+            importAPISequence(outSequenceName, registry, APIConstants.API_CUSTOM_SEQUENCE_TYPE_OUT,pathToArchive,
+                APIImportExportConstants.OUT_SEQUENCE_LOCATION);
         }
 
-        String faultSequenceFileName = importedApi.getFaultSequence() + APIImportExportConstants.XML_EXTENSION;
-        String faultSequenceFileLocation = pathToArchive + APIImportExportConstants.FAULT_SEQUENCE_LOCATION
-                + faultSequenceFileName;
-
         //Adding fault-sequence, if any
-        if (checkFileExistence(faultSequenceFileLocation)) {
-            addSequenceToRegistry(registry, APIConstants.API_CUSTOM_SEQUENCE_TYPE_FAULT,
-                    faultSequenceFileName, faultSequenceFileLocation);
+        String faultSequenceName = importedApi.getFaultSequence();
+        if (faultSequenceName != null && !faultSequenceName.isEmpty()) {
+            importAPISequence(faultSequenceName, registry, APIConstants.API_CUSTOM_SEQUENCE_TYPE_FAULT, pathToArchive,
+                APIImportExportConstants.FAULT_SEQUENCE_LOCATION);
+        }
+    }
+
+    /**
+     * Import custom sequences
+     *
+     * @param sequenceName  Name of the sequence
+     * @param registry  Tenant registry
+     * @param direction  Direction of the sequence
+     * @param pathToArchive Location of the extracted folder of the imported APi archive
+     */
+    private static void importAPISequence(String sequenceName, Registry registry, String direction,
+            String pathToArchive, String sequenceLocation)
+    {
+        String sequenceFileLocation = pathToArchive + sequenceLocation;
+        File sequenceFileFolder = new File(sequenceFileLocation);
+        File[] fileList = sequenceFileFolder.listFiles();
+        String sequenceFileName;
+        InputStream fileInputStream = null;
+        for (final File fileEntry : fileList) {
+            if (fileEntry.isFile()) {
+                try {
+                    fileInputStream = new FileInputStream(fileEntry);
+                    OMElement seqElement = APIUtil.buildOMElement(fileInputStream);
+                    if (sequenceName.equals(seqElement.getAttributeValue(new QName("name")))) {
+                        sequenceFileName = FilenameUtils.getName(fileEntry.getName());
+                        addSequenceToRegistry(registry, direction, sequenceFileName,
+                                sequenceFileLocation + sequenceFileName);
+                    }
+                } catch (Exception e) {
+                    //this error is logged and ignored because sequences are optional in an API
+                    log.error("Failed to retrieve Sequence of imported API.", e);
+                } finally {
+                    IOUtils.closeQuietly(fileInputStream);
+                }
+            }
         }
     }
 
@@ -434,8 +463,8 @@ public final class APIImportUtil {
     private static void addSequenceToRegistry(Registry registry, String customSequenceType, String sequenceFileName,
                                               String sequenceFileLocation) {
 
-        String regResourcePath = APIConstants.API_CUSTOM_SEQUENCE_LOCATION + File.separator + customSequenceType
-                + File.separator + sequenceFileName;
+        String regResourcePath = APIConstants.API_CUSTOM_SEQUENCE_LOCATION + RegistryConstants.PATH_SEPARATOR +
+             customSequenceType + RegistryConstants.PATH_SEPARATOR + sequenceFileName;
         InputStream inSeqStream = null;
         try {
             if (registry.resourceExists(regResourcePath)) {
@@ -499,25 +528,68 @@ public final class APIImportUtil {
     /**
      * This method adds Swagger API definition to registry
      *
-     * @param apiId       Identifier of the imported API
+     * @param importedApi Imported API
      * @param archivePath File path where API archive stored
+     * @param tenantId Id of the current tenant
      * @throws APIImportException if there is an error occurs when adding Swagger definition
      */
-    private static void addSwaggerDefinition(APIIdentifier apiId, String archivePath)
+    private static void addSwaggerDefinition(API importedApi, String archivePath, int tenantId)
             throws APIImportException {
 
         try {
             String swaggerContent = FileUtils.readFileToString(
                     new File(archivePath + APIImportExportConstants.SWAGGER_DEFINITION_LOCATION));
-            provider.saveSwagger20Definition(apiId, swaggerContent);
+
+            updateApiResourcesFromSwagger(importedApi, swaggerContent, tenantId);
+            provider.updateAPI(importedApi);
+            provider.saveSwagger20Definition(importedApi.getId(), swaggerContent);
         } catch (APIManagementException e) {
             log.error("Error in adding Swagger definition for the API. ", e);
             throw new APIImportException("Error in adding Swagger definition for the API. " + e.getMessage());
         } catch (IOException e) {
             log.error("Error in importing Swagger definition for the API. ", e);
             throw new APIImportException("Error in importing Swagger definition for the API. " + e.getMessage());
+        } catch (FaultGatewaysException e) {
+            log.error("Failed to update API after adding resources and scopes. ", e);
+            throw new APIImportException("Failed to update API after adding resources and scopes. " + e.getMessage());
         }
     }
+
+    /**
+     * Add URI templates and scopes retrieved from swagger.json to the imported API
+     * @param importedApi Imported API
+     * @param swaggerContent  Content of swagger.json
+     * @param tenantId  Current tenant ID
+     * @throws APIManagementException If an error occurs while adding resources to the imported api
+     */
+    private static void updateApiResourcesFromSwagger(API importedApi, String swaggerContent, int tenantId)
+        throws APIManagementException {
+
+        APIDefinition definitionFromSwagger20 = new APIDefinitionFromSwagger20();
+        //retrieve URI templates
+        Set<URITemplate> uriTemplates = definitionFromSwagger20.getURITemplates(importedApi, swaggerContent);
+
+        //retrieve scopes
+        Set<Scope> scopes = definitionFromSwagger20.getScopes(String.valueOf(swaggerContent));
+
+        //Check whether scopes of importing api are already assigned by another API
+        //If so, import process gets halted by throwing an exception
+        for (Scope scope : scopes) {
+            if (scope != null && !(ScopesIssuer.getInstance().isWhiteListedScope(scope.getKey()))) {
+                if (provider.isScopeKeyExist(scope.getKey(), tenantId)) {
+                    log.error("Unable to assign scope! " + scope.getKey() + " is already assigned by another API");
+                    provider.deleteAPI(importedApi.getId());
+                    throw new APIManagementException("Unable to assign scope! " + scope.getKey() +
+                        " is already assigned by another API");
+                }
+            }
+        }
+
+        //set URI templates and scopes to the imported API
+        importedApi.setUriTemplates(uriTemplates);
+        importedApi.setScopes(scopes);
+    }
+
 
     /**
      * This method checks whether a given file exists in a given location
